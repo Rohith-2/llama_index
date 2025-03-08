@@ -1,14 +1,16 @@
-import json
 import logging
-import os
 
 from typing import Any, Callable, Dict, List, Optional, cast
+
+import bm25_fusion as bm25f
+from nltk.stem import PorterStemmer
 
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.callbacks.base import CallbackManager
 from llama_index.core.constants import DEFAULT_SIMILARITY_TOP_K
 from llama_index.core.indices.vector_store.base import VectorStoreIndex
 from llama_index.core.schema import (
+    TextNode,
     BaseNode,
     IndexNode,
     NodeWithScore,
@@ -20,10 +22,6 @@ from llama_index.core.vector_stores.utils import (
     node_to_metadata_dict,
     metadata_dict_to_node,
 )
-
-import bm25s
-import Stemmer
-
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +61,9 @@ class BM25Retriever(BaseRetriever):
     def __init__(
         self,
         nodes: Optional[List[BaseNode]] = None,
-        stemmer: Optional[Stemmer.Stemmer] = None,
+        stemmer: Optional[PorterStemmer] = None,
         language: str = "en",
-        existing_bm25: Optional[bm25s.BM25] = None,
+        existing_bm25: Optional[bm25f.BM25] = None,
         similarity_top_k: int = DEFAULT_SIMILARITY_TOP_K,
         callback_manager: Optional[CallbackManager] = None,
         objects: Optional[List[IndexNode]] = None,
@@ -73,30 +71,35 @@ class BM25Retriever(BaseRetriever):
         verbose: bool = False,
         skip_stemming: bool = False,
         token_pattern: str = r"(?u)\b\w\w+\b",
+        variant:Optional[str] = 'bm25+',
+        do_keyword:Optional[str] = 'False'
+
     ) -> None:
-        self.stemmer = stemmer or Stemmer.Stemmer("english")
+        self.stemmer = stemmer or PorterStemmer()
         self.similarity_top_k = similarity_top_k
         self.token_pattern = token_pattern
         self.skip_stemming = skip_stemming
+        self.do_keyword = do_keyword
+        self.metadata_filter = {}
 
         if existing_bm25 is not None:
             self.bm25 = existing_bm25
-            self.corpus = existing_bm25.corpus
+            #self.corpus = existing_bm25.corpus
         else:
             if nodes is None:
                 raise ValueError("Please pass nodes or an existing BM25 object.")
 
             self.corpus = [node_to_metadata_dict(node) for node in nodes]
+            for i, node in enumerate(nodes):
+                node.metadata["_id_no"] = i
+                
+            metadata = [node.metadata for node in nodes]
 
-            corpus_tokens = bm25s.tokenize(
-                [node.get_content(metadata_mode=MetadataMode.EMBED) for node in nodes],
-                stopwords=language,
-                stemmer=self.stemmer if not skip_stemming else None,
-                token_pattern=self.token_pattern,
-                show_progress=verbose,
-            )
-            self.bm25 = bm25s.BM25()
-            self.bm25.index(corpus_tokens, show_progress=verbose)
+            self.bm25 = bm25f.BM25([node.get_content()
+                                    for node in nodes],metadata=metadata, do_stem=skip_stemming,
+                                    stemmer=self.stemmer if not skip_stemming\
+                                    else None,variant=variant,do_keyword=self.do_keyword)
+
         super().__init__(
             callback_manager=callback_manager,
             object_map=object_map,
@@ -110,12 +113,13 @@ class BM25Retriever(BaseRetriever):
         index: Optional[VectorStoreIndex] = None,
         nodes: Optional[List[BaseNode]] = None,
         docstore: Optional[BaseDocumentStore] = None,
-        stemmer: Optional[Stemmer.Stemmer] = None,
-        language: str = "en",
+        stemmer: Optional[PorterStemmer] = None,
         similarity_top_k: int = DEFAULT_SIMILARITY_TOP_K,
         verbose: bool = False,
         skip_stemming: bool = False,
-        token_pattern: str = r"(?u)\b\w\w+\b",
+        variant:Optional[str]="bm25+",
+        do_keyword:Optional[str] = True,
+
         # deprecated
         tokenizer: Optional[Callable[[str], List[str]]] = None,
     ) -> "BM25Retriever":
@@ -142,11 +146,11 @@ class BM25Retriever(BaseRetriever):
         return cls(
             nodes=nodes,
             stemmer=stemmer,
-            language=language,
             similarity_top_k=similarity_top_k,
             verbose=verbose,
             skip_stemming=skip_stemming,
-            token_pattern=token_pattern,
+            variant = variant,
+            do_keyword = do_keyword
         )
 
     def get_persist_args(self) -> Dict[str, Any]:
@@ -157,48 +161,32 @@ class BM25Retriever(BaseRetriever):
             if hasattr(self, key)
         }
 
-    def persist(self, path: str, encoding: str = "utf-8", **kwargs: Any) -> None:
+    def persist(self, path: str) -> None:
         """Persist the retriever to a directory."""
-        self.bm25.save(path, corpus=self.corpus, **kwargs)
-        with open(
-            os.path.join(path, DEFAULT_PERSIST_FILENAME), "w", encoding=encoding
-        ) as f:
-            json.dump(self.get_persist_args(), f, indent=2)
+        if 'h5' not in path:
+            path+= '.h5'
+        self.bm25.save_hdf5(path)
 
     @classmethod
-    def from_persist_dir(
-        cls, path: str, encoding: str = "utf-8", **kwargs: Any
-    ) -> "BM25Retriever":
+    def from_persist_dir(cls, path: str) -> "BM25Retriever":
         """Load the retriever from a directory."""
-        bm25 = bm25s.BM25.load(path, load_corpus=True, **kwargs)
-        with open(os.path.join(path, DEFAULT_PERSIST_FILENAME), encoding=encoding) as f:
-            retriever_data = json.load(f)
-        return cls(existing_bm25=bm25, **retriever_data)
+        if 'h5' not in path:
+            path +='.h5'
+        bm25 = bm25f.BM25.load_hdf5(path)
+        return cls(existing_bm25=bm25)
+    
+    def set_filter(self,metadata_filter: Optional[dict] = None,):
+        self.metadata_filter = metadata_filter
 
     def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
         query = query_bundle.query_str
-        tokenized_query = bm25s.tokenize(
-            query,
-            stemmer=self.stemmer if not self.skip_stemming else None,
-            token_pattern=self.token_pattern,
-            show_progress=self._verbose,
+        results = self.bm25.query(
+            query, metadata_filter=self.metadata_filter,top_k=self.similarity_top_k, do_keyword=self.do_keyword
         )
-        indexes, scores = self.bm25.retrieve(
-            tokenized_query, k=self.similarity_top_k, show_progress=self._verbose
-        )
+        print(query,results)
 
-        # batched, but only one query
-        indexes = indexes[0]
-        scores = scores[0]
-
-        nodes: List[NodeWithScore] = []
-        for idx, score in zip(indexes, scores):
-            # idx can be an int or a dict of the node
-            if isinstance(idx, dict):
-                node = metadata_dict_to_node(idx)
-            else:
-                node_dict = self.corpus[int(idx)]
-                node = metadata_dict_to_node(node_dict)
-            nodes.append(NodeWithScore(node=node, score=float(score)))
+        nodes: List[NodeWithScore] = [NodeWithScore(node=TextNode(text=node_dict['text'], metadata=node_dict),\
+                                                     score=float(node_dict['score']))\
+                                      for node_dict in results]
 
         return nodes
